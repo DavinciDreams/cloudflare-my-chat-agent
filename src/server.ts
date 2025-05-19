@@ -10,17 +10,36 @@ import {
   type StreamTextOnFinishCallback,
   type ToolSet,
 } from "ai";
-import { openai } from "@ai-sdk/openai";
+// import { openai } from "@ai-sdk/openai";
+// Replaced with OpenRouter integration below
+
 import { processToolCalls } from "./utils";
 import { tools, executions } from "./tools";
 // import { env } from "cloudflare:workers";
 
-const model = openai("gpt-4o-2024-11-20");
-// Cloudflare AI Gateway
-// const openai = createOpenAI({
-//   apiKey: env.OPENAI_API_KEY,
-//   baseURL: env.GATEWAY_BASE_URL,
-// });
+// OpenRouter integration
+const OPENROUTER_API_KEY = (globalThis as any).env?.OPENROUTER_API_KEY;
+const OPENROUTER_BASE_URL = (globalThis as any).env?.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+
+// Use Qwen model by default
+async function openrouterChatCompletion(messages: {role: string; content: string}[], model: string = 'qwen/qwen3-235b-a22b:free') {
+  const response = await fetch(`${OPENROUTER_BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      messages
+    })
+  });
+  if (!response.ok) {
+    throw new Error(`OpenRouter API error: ${response.status} ${await response.text()}`);
+  }
+  return response.json();
+}
+
 
 /**
  * Chat Agent implementation that handles real-time AI chat interactions
@@ -57,31 +76,30 @@ export class Chat extends AIChatAgent<Env> {
           executions,
         });
 
-        // Stream the AI response using GPT-4
-        const result = streamText({
-          model,
-          system: `You are a helpful assistant that can do various tasks... 
-
-${unstable_getSchedulePrompt({ date: new Date() })}
-
-If the user asks to schedule a task, use the schedule tool to schedule the task.
-`,
-          messages: processedMessages,
-          tools: allTools,
-          onFinish: async (args) => {
-            onFinish(
-              args as Parameters<StreamTextOnFinishCallback<ToolSet>>[0]
-            );
-            // await this.mcp.closeConnection(mcpConnection.id);
-          },
-          onError: (error) => {
-            console.error("Error while streaming:", error);
-          },
-          maxSteps: 10,
-        });
-
-        // Merge the AI response stream with tool execution outputs
-        result.mergeIntoDataStream(dataStream);
+        // Call OpenRouter for chat completion using Qwen
+        try {
+          const systemPrompt = `You are a helpful assistant that can do various tasks...\n\n${unstable_getSchedulePrompt({ date: new Date() })}\n\nIf the user asks to schedule a task, use the schedule tool to schedule the task.`;
+          // OpenRouter expects system prompt as a message
+          const orMessages = [
+            { role: 'system', content: systemPrompt },
+            ...processedMessages.map((m: any) => ({ role: m.role, content: m.content }))
+          ];
+          const result = await openrouterChatCompletion(orMessages, 'qwen/qwen3-235b-a22b:free');
+          // Stream the response into dataStream
+          if (result.choices && result.choices[0] && result.choices[0].message) {
+            dataStream.send({
+              type: 'text',
+              content: result.choices[0].message.content
+            });
+            onFinish({
+              message: result.choices[0].message
+            } as Parameters<StreamTextOnFinishCallback<ToolSet>>[0]);
+          } else {
+            throw new Error('No valid response from OpenRouter');
+          }
+        } catch (error) {
+          console.error("Error while streaming:", error);
+        }
       },
     });
 
